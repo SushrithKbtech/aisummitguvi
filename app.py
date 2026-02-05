@@ -45,6 +45,8 @@ MAX_TOTAL_MESSAGES = get_int_env("MAX_TOTAL_MESSAGES", "0")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(APP_NAME)
+for noisy_logger in ("httpx", "openai", "urllib3"):
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 client = None
 if OPENAI_API_KEY and OpenAI:
@@ -641,6 +643,19 @@ def choose_slot(missing_slots: List[str], last_message: str) -> Optional[str]:
     return None
 
 
+def contextualize_question(question: str, last_message: str) -> str:
+    if not question:
+        return question
+    lower = (last_message or "").lower()
+    if any(word in lower for word in ["otp", "pin", "password"]):
+        prefix = "I can't share OTPs. "
+    elif any(word in lower for word in ["account", "bank", "upi", "transaction", "fraud"]):
+        prefix = "Before I proceed, "
+    else:
+        prefix = "Just to verify, "
+    return f"{prefix}{question}"
+
+
 def reply_mentions_slot(reply: str, slot: str) -> bool:
     lower_reply = reply.lower()
     for keyword in SLOT_KEYWORDS.get(slot, []):
@@ -672,6 +687,7 @@ def generate_reply(
     target_slot: Optional[str],
 ) -> str:
     slot_question = FALLBACK_RESPONSES.get(target_slot or "", "Could you clarify this?")
+    slot_question = contextualize_question(slot_question, last_message.text)
 
     if not client or not USE_LLM_REPLY:
         return slot_question
@@ -1022,7 +1038,7 @@ async def handle_message(
     if should_callback:
         background_tasks.add_task(send_callback, result_payload)
 
-    return {
+    response_body = {
         "status": "success",
         "reply": reply,
         "scamDetected": scam_detected,
@@ -1031,3 +1047,7 @@ async def handle_message(
         "agentNotes": agent_notes,
         "callbackSent": should_callback,
     }
+    if should_callback:
+        response_body["finalOutput"] = result_payload
+
+    return response_body
