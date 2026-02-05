@@ -5,7 +5,7 @@ import logging
 from typing import List, Optional, Dict, Any
 
 import requests
-from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, Body
 from pydantic import BaseModel, Field
 from pydantic import ConfigDict
 
@@ -763,12 +763,27 @@ async def healthcheck() -> Dict[str, str]:
 
 @app.post("/message")
 async def handle_message(
-    request: IncomingRequest,
     background_tasks: BackgroundTasks,
+    payload: Optional[Dict[str, Any]] = Body(None),
     x_api_key: Optional[str] = Header(None, alias="x-api-key"),
 ) -> Dict[str, Any]:
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+    if not payload:
+        return {
+            "status": "success",
+            "reply": "OK",
+        }
+
+    try:
+        request = IncomingRequest.model_validate(payload)
+    except Exception as exc:
+        logger.warning("Invalid payload: %s", exc)
+        return {
+            "status": "success",
+            "reply": "OK",
+        }
 
     history = request.conversationHistory or []
     current = request.message
