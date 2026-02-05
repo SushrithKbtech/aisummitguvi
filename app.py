@@ -5,7 +5,7 @@ import logging
 from typing import List, Optional, Dict, Any
 
 import requests
-from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, Body
+from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, Body, Request
 from pydantic import BaseModel, Field
 from pydantic import ConfigDict
 
@@ -698,6 +698,67 @@ def build_agent_notes(intel: Dict[str, List[str]], scam_detected: bool) -> str:
     return "; ".join(notes) + "."
 
 
+def normalize_message(data: Any, default_sender: str = "scammer") -> Optional[Dict[str, Any]]:
+    if not isinstance(data, dict):
+        return None
+
+    sender = (
+        data.get("sender")
+        or data.get("role")
+        or data.get("from")
+        or data.get("author")
+        or default_sender
+    )
+    text = data.get("text") or data.get("message") or data.get("content") or data.get("body")
+    if not text:
+        return None
+
+    timestamp = data.get("timestamp") or data.get("time") or data.get("ts")
+    return {"sender": str(sender), "text": str(text), "timestamp": timestamp}
+
+
+def normalize_payload(payload: Any) -> Optional[Dict[str, Any]]:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    normalized: Dict[str, Any] = dict(payload)
+
+    session_id = (
+        payload.get("sessionId")
+        or payload.get("session_id")
+        or payload.get("sessionID")
+        or payload.get("sessionid")
+    )
+    if session_id:
+        normalized["sessionId"] = session_id
+
+    message_data = payload.get("message")
+    if not message_data and any(key in payload for key in ["text", "message", "content", "body"]):
+        message_data = payload
+    message = normalize_message(message_data) if message_data else None
+    if message:
+        normalized["message"] = message
+
+    history = (
+        payload.get("conversationHistory")
+        or payload.get("conversation_history")
+        or payload.get("history")
+        or payload.get("messages")
+        or payload.get("conversation")
+    )
+    if isinstance(history, list):
+        normalized_history = []
+        for item in history:
+            msg = normalize_message(item, default_sender="scammer")
+            if msg:
+                normalized_history.append(msg)
+        normalized["conversationHistory"] = normalized_history
+
+    return normalized
+
+
 def count_messages(history: List[Message], current: Message) -> Dict[str, int]:
     all_messages = history + [current]
     scammer_count = sum(1 for m in all_messages if m.sender.lower() == "scammer")
@@ -763,6 +824,7 @@ async def healthcheck() -> Dict[str, str]:
 
 @app.post("/message")
 async def handle_message(
+    request: Request,
     background_tasks: BackgroundTasks,
     payload: Optional[Dict[str, Any]] = Body(None),
     x_api_key: Optional[str] = Header(None, alias="x-api-key"),
@@ -770,20 +832,23 @@ async def handle_message(
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    if not payload:
-        return {
-            "status": "success",
-            "reply": "OK",
-        }
+    if payload is None:
+        try:
+            raw = await request.body()
+            if raw:
+                payload = json.loads(raw.decode("utf-8"))
+        except Exception:
+            payload = None
+
+    normalized_payload = normalize_payload(payload)
+    if not normalized_payload:
+        return {"status": "success", "reply": "OK"}
 
     try:
-        request = IncomingRequest.model_validate(payload)
+        request = IncomingRequest.model_validate(normalized_payload)
     except Exception as exc:
         logger.warning("Invalid payload: %s", exc)
-        return {
-            "status": "success",
-            "reply": "OK",
-        }
+        return {"status": "success", "reply": "OK"}
 
     history = request.conversationHistory or []
     current = request.message
