@@ -2,7 +2,9 @@
 import re
 import json
 import logging
+import uuid
 from typing import List, Optional, Dict, Any
+from urllib.parse import parse_qs
 
 import requests
 from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, Body, Request
@@ -699,6 +701,13 @@ def build_agent_notes(intel: Dict[str, List[str]], scam_detected: bool) -> str:
 
 
 def normalize_message(data: Any, default_sender: str = "scammer") -> Optional[Dict[str, Any]]:
+    if data is None:
+        return None
+    if isinstance(data, str):
+        text = data.strip()
+        if not text:
+            return None
+        return {"sender": default_sender, "text": text, "timestamp": None}
     if not isinstance(data, dict):
         return None
 
@@ -717,36 +726,83 @@ def normalize_message(data: Any, default_sender: str = "scammer") -> Optional[Di
     return {"sender": str(sender), "text": str(text), "timestamp": timestamp}
 
 
+def parse_body_bytes(raw: bytes) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        pass
+
+    try:
+        decoded = raw.decode("utf-8", errors="ignore")
+        if "=" in decoded:
+            parsed = parse_qs(decoded, keep_blank_values=False)
+            if parsed:
+                flattened = {}
+                for key, values in parsed.items():
+                    if not values:
+                        continue
+                    flattened[key] = values[0] if len(values) == 1 else values
+                return flattened
+    except Exception:
+        pass
+
+    return None
+
+
+def ensure_session_id(normalized: Dict[str, Any]) -> None:
+    if not normalized.get("sessionId"):
+        normalized["sessionId"] = f"auto-{uuid.uuid4().hex[:12]}"
+
+
 def normalize_payload(payload: Any) -> Optional[Dict[str, Any]]:
     if payload is None:
         return None
+    if isinstance(payload, str):
+        payload = {"message": payload}
     if not isinstance(payload, dict):
         return None
 
-    normalized: Dict[str, Any] = dict(payload)
+    root = payload
+    for key in ["data", "payload", "event"]:
+        if isinstance(payload.get(key), dict):
+            root = payload.get(key)
+            break
+        if isinstance(payload.get(key), str):
+            try:
+                candidate = json.loads(payload.get(key))
+            except Exception:
+                candidate = None
+            if isinstance(candidate, dict):
+                root = candidate
+                break
+
+    normalized: Dict[str, Any] = dict(root)
 
     session_id = (
-        payload.get("sessionId")
-        or payload.get("session_id")
-        or payload.get("sessionID")
-        or payload.get("sessionid")
+        root.get("sessionId")
+        or root.get("session_id")
+        or root.get("sessionID")
+        or root.get("sessionid")
+        or root.get("session")
+        or payload.get("sessionId")
     )
     if session_id:
         normalized["sessionId"] = session_id
 
-    message_data = payload.get("message")
-    if not message_data and any(key in payload for key in ["text", "message", "content", "body"]):
-        message_data = payload
+    message_data = root.get("message") or root.get("msg") or root.get("text")
+    if not message_data and any(key in root for key in ["text", "message", "content", "body"]):
+        message_data = root
     message = normalize_message(message_data) if message_data else None
     if message:
         normalized["message"] = message
 
     history = (
-        payload.get("conversationHistory")
-        or payload.get("conversation_history")
-        or payload.get("history")
-        or payload.get("messages")
-        or payload.get("conversation")
+        root.get("conversationHistory")
+        or root.get("conversation_history")
+        or root.get("history")
+        or root.get("messages")
+        or root.get("conversation")
+        or payload.get("conversationHistory")
     )
     if isinstance(history, list):
         normalized_history = []
@@ -756,6 +812,7 @@ def normalize_payload(payload: Any) -> Optional[Dict[str, Any]]:
                 normalized_history.append(msg)
         normalized["conversationHistory"] = normalized_history
 
+    ensure_session_id(normalized)
     return normalized
 
 
@@ -836,7 +893,7 @@ async def handle_message(
         try:
             raw = await request.body()
             if raw:
-                payload = json.loads(raw.decode("utf-8"))
+                payload = parse_body_bytes(raw)
         except Exception:
             payload = None
 
