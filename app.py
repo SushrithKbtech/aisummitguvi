@@ -795,6 +795,8 @@ def normalize_message(data: Any, default_sender: str = "scammer") -> Optional[Di
         return None
 
     timestamp = data.get("timestamp") or data.get("time") or data.get("ts")
+    if timestamp is not None:
+        timestamp = str(timestamp)
     return {"sender": str(sender), "text": str(text), "timestamp": timestamp}
 
 
