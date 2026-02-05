@@ -124,7 +124,7 @@ SLOT_KEYWORDS = {
     "phishingLinks": ["link", "url", "website", "portal", "download link"],
     "phoneNumbers": ["phone", "call", "number", "mobile"],
     "employeeIds": ["employee id", "agent id", "staff id", "agent number"],
-    "orgNames": ["bank", "organization", "company"],
+    "orgNames": ["bank", "organization", "company", "branch"],
     "accountLast4": ["last 4", "ending", "last four"],
     "complaintIds": ["complaint", "reference", "ref", "ticket", "case id"],
     "callbackNumbers": ["callback", "call back", "call-back", "helpline"],
@@ -134,7 +134,7 @@ SLOT_KEYWORDS = {
     "merchantNames": ["merchant", "beneficiary"],
     "amounts": ["amount", "fee", "charge", "pay"],
     "ifscCodes": ["ifsc"],
-    "departmentNames": ["department", "desk", "cell"],
+    "departmentNames": ["department", "desk", "cell", "fraud team"],
     "designations": ["designation", "role", "position"],
     "supervisorNames": ["supervisor", "manager", "team lead"],
     "scammerNames": ["name", "who am i speaking to"],
@@ -201,6 +201,7 @@ SUSPICIOUS_KEYWORDS = [
     "account will be blocked",
     "account suspension",
     "account suspended",
+    "account compromised",
     "verify",
     "verification",
     "otp",
@@ -214,6 +215,8 @@ SUSPICIOUS_KEYWORDS = [
     "suspension",
     "suspended",
     "blocked",
+    "block",
+    "secure",
     "refund",
     "cashback",
     "income tax refund",
@@ -246,7 +249,31 @@ SUSPICIOUS_KEYWORDS = [
     "customs",
     "fraud prevention",
     "verification team",
+    "fraudulent transaction",
+    "transaction",
     "fraud",
+]
+
+DETECTION_KEYWORDS = [
+    "urgent",
+    "immediately",
+    "account blocked",
+    "account will be blocked",
+    "otp",
+    "pin",
+    "password",
+    "kyc",
+    "verification",
+    "refund",
+    "prize",
+    "lottery",
+    "apk",
+    "remote access",
+    "upi",
+    "bank",
+    "fraud",
+    "income tax",
+    "sim swap",
 ]
 
 ORG_KEYWORDS = {
@@ -344,8 +371,10 @@ def extract_regex_items(text: str) -> Dict[str, List[str]]:
     lower = text.lower()
 
     for keyword in SUSPICIOUS_KEYWORDS:
-        if keyword in lower:
-            findings["suspiciousKeywords"].append(keyword)
+        pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+        match = pattern.search(text)
+        if match:
+            findings["suspiciousKeywords"].append(match.group(0))
 
     for keyword, org in ORG_KEYWORDS.items():
         if keyword in lower:
@@ -369,6 +398,15 @@ def extract_regex_items(text: str) -> Dict[str, List[str]]:
     apk_pattern = re.compile(r"\b[\w\-]{2,}\.apk\b", re.IGNORECASE)
     for apk in apk_pattern.findall(text):
         findings["appNames"].append(apk)
+
+    branch_pattern = re.compile(r"\b([A-Za-z]+)\s+branch\b", re.IGNORECASE)
+    for match in branch_pattern.finditer(text):
+        phrase = match.group(0)
+        location = match.group(1)
+        if phrase:
+            findings["orgNames"].append(phrase)
+        if location:
+            findings["orgNames"].append(location)
 
     upi_pattern = re.compile(r"\b[\w.\-]{2,}@[A-Za-z0-9]{2,}\b")
     for candidate in upi_pattern.findall(text):
@@ -520,7 +558,7 @@ def detect_scam(messages: List[Message]) -> bool:
 
     recent_text = " ".join([m.text.lower() for m in messages[-6:]])
     score = 0
-    for keyword in SUSPICIOUS_KEYWORDS:
+    for keyword in DETECTION_KEYWORDS:
         if keyword in recent_text:
             score += 1
 
@@ -603,6 +641,30 @@ def choose_slot(missing_slots: List[str], last_message: str) -> Optional[str]:
     return None
 
 
+def reply_mentions_slot(reply: str, slot: str) -> bool:
+    lower_reply = reply.lower()
+    for keyword in SLOT_KEYWORDS.get(slot, []):
+        if keyword in lower_reply:
+            return True
+    return False
+
+
+def is_repetitive_reply(reply: str, history: List[Message]) -> bool:
+    tokens = set(re.findall(r"[a-zA-Z0-9]+", reply.lower()))
+    if not tokens:
+        return False
+    for msg in history:
+        if msg.sender.lower() != "user":
+            continue
+        prev_tokens = set(re.findall(r"[a-zA-Z0-9]+", msg.text.lower()))
+        if not prev_tokens:
+            continue
+        similarity = len(tokens & prev_tokens) / max(len(tokens | prev_tokens), 1)
+        if similarity >= 0.6:
+            return True
+    return False
+
+
 def generate_reply(
     last_message: Message,
     history: List[Message],
@@ -626,7 +688,8 @@ def generate_reply(
         "3) Keep reply 1-2 sentences, natural and human. "
         "4) Do not share OTP/PIN/password. "
         "5) Never mention being an AI or scam detection. "
-        "6) Do not invent a name or personal identity; stay generic."
+        "6) Do not invent a name or personal identity; stay generic. "
+        "7) Use the suggested question (verbatim or lightly paraphrased). Do not ask for explanations."
     )
 
     user_prompt = (
@@ -649,6 +712,15 @@ def generate_reply(
         )
         reply = response.choices[0].message.content.strip()
         if not reply:
+            return slot_question
+
+        if reply.count("?") > 1:
+            return slot_question
+
+        if target_slot and not reply_mentions_slot(reply, target_slot):
+            return slot_question
+
+        if is_repetitive_reply(reply, history):
             return slot_question
 
         # Guardrail: avoid repeating previously asked slot keywords
